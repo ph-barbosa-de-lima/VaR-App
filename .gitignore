@@ -1,0 +1,352 @@
+import numpy as np
+import pandas as pd
+import yfinance as yf
+from scipy.stats import norm
+from scipy.stats import chi2
+import matplotlib.pyplot as plt
+import warnings
+import os # Import the os module
+
+# Ignorar FutureWarning do pandas/yfinance
+warnings.filterwarnings("ignore", category=FutureWarning)
+
+
+# Tickers: Vibra (VBBR3.SA), McDonald's (MCD), Uber (UBER), VALE (VALE3.SA), Goldman Sachs (GS)
+TICKERS = ["VBR", "MCD", "UBER", "VALE", "GS"]
+START_DATE = "2022-01-01"  # Aproximadamente 3 anos de dados
+END_DATE = None  # Até hoje
+CONFIDENCE_LEVELS = [0.95, 0.975, 0.99]
+HORIZON_DAYS = 1  # VaR 1 dia
+
+# Pesos da carteira (distribuição igualitária)
+weights = np.array([1/len(TICKERS)] * len(TICKERS), dtype=float)
+weights = weights / weights.sum() # Garantir que a soma é 1.0
+
+def get_data_and_returns(tickers, start, end):
+    prices = yf.download(tickers, start=start, end=end, auto_adjust=True, progress=False)["Close"]
+    prices = prices.dropna(how="all").dropna(axis=1)
+
+    # Atualiza a lista de tickers com os que foram baixados com sucesso
+    valid_tickers = list(prices.columns)
+
+    # Recalcula os pesos para os tickers válidos
+    if not valid_tickers:
+        print("Erro: Nenhum ticker foi baixado com sucesso. Encerrando o programa.")
+        exit()
+    elif len(valid_tickers) < len(tickers):
+        print(f"Aviso: Apenas os seguintes tickers foram baixados com sucesso: {valid_tickers}")
+        # Distribuição igualitária entre os tickers válidos
+        w = np.array([1/len(valid_tickers)] * len(valid_tickers), dtype=float)
+        w = w / w.sum()
+    else:
+        w = weights
+
+    rets = np.log(prices / prices.shift(1)).dropna()
+
+    # Ajusta os retornos e pesos para o mesmo conjunto de tickers
+    rets = rets[valid_tickers]
+
+    mu_vec = rets.mean().values
+    cov_mat = rets.cov().values
+    sigma_vec = rets.std().values
+
+    port_ret = rets @ w
+    mu_p = port_ret.mean()
+    sigma_p = port_ret.std()
+
+    return rets, valid_tickers, w, mu_vec, cov_mat, sigma_vec, port_ret, mu_p, sigma_p
+
+def var_historico(returns: pd.Series, alpha: float) -> float:
+    q = returns.quantile(1 - alpha)
+    return max(0.0, -q)
+
+def var_parametrico_normal(mu: float, sigma: float, alpha: float) -> float:
+    z = norm.ppf(1 - alpha)
+    var = -(mu + z * sigma)
+    return float(max(0.0, var))
+
+def var_mc_normal_univariado(mu: float, sigma: float, alpha: float, n_sims: int = 50_000) -> float:
+    sims = np.random.normal(loc=mu, scale=sigma, size=n_sims)
+    q = np.quantile(sims, 1 - alpha)
+    return float(max(0.0, -q))
+
+def var_mc_normal_multivariado(mu_vec: np.ndarray, cov: np.ndarray, w: np.ndarray,
+                               alpha: float, n_sims: int = 100_000) -> float:
+    sims = np.random.multivariate_normal(mean=mu_vec, cov=cov, size=n_sims)
+    port_sims = sims @ w
+    q = np.quantile(port_sims, 1 - alpha)
+    return float(max(0.0, -q))
+
+#Backtesting (Teste de Kupiec)
+def kupiec_test(returns: pd.Series, var_values: pd.Series, alpha: float, window: int = 252) -> tuple:
+    """
+    Realiza o Teste de Proporção de Falhas (Kupiec) para o VaR.
+    returns: Série de retornos da carteira.
+    var_values: Série de valores de VaR (em percentual, ex: 0.02 para 2%).
+    alpha: Nível de confiança (ex: 0.99).
+    window: Tamanho da janela móvel para o backtesting (ex: 252 dias úteis).
+    Retorna: (número de violações, p-valor do teste)
+    """
+
+    # O VaR é uma perda (positiva), a violação ocorre quando o retorno (negativo) é menor que -VaR
+    # returns < -var_values
+
+    # Alinha as séries de retorno e VaR (o VaR é calculado com dados até t-1 para prever t)
+    # O VaR é calculado sobre a janela móvel, então a série de VaR terá o mesmo tamanho de returns
+
+    # A série de VaR deve ser em percentual (0.0X) e não em % (X.XX)
+    var_values_pct = var_values / 100.0
+
+    # Calcula as violações (exceções)
+    # O retorno é negativo em caso de perda. A violação ocorre quando a perda é maior que o VaR.
+    # Perda = -retorno. Violação: -retorno > VaR_valor => retorno < -VaR_valor
+    violations = (returns < -var_values_pct).astype(int)
+
+    # O teste de Kupiec é aplicado sobre a janela total de observações
+    T = len(violations)
+    N = violations.sum() # Número de violações
+    p = 1 - alpha # Probabilidade esperada de violação
+
+    # Se T for muito pequeno, o teste não é confiável
+    if T < 30:
+        return N, np.nan
+
+    # Estatística do teste de Kupiec (LR_uc)
+    # H0: p_hat = p (modelo adequado)
+    # H1: p_hat != p (modelo inadequado)
+    p_hat = N / T
+
+    if N == 0:
+        # Evita log(0)
+        LR_uc = -2 * (T * np.log(1 - p))
+    elif N == T:
+        # Evita log(0)
+        LR_uc = -2 * (T * np.log(p))
+    else:
+        LR_uc = -2 * (np.log(((1 - p)**(T - N)) * (p**N)) - np.log(((1 - p_hat)**(T - N)) * (p_hat**N)))
+
+    # O p-valor é calculado a partir da distribuição qui-quadrado com 1 grau de liberdade
+    p_value = 1 - chi2.cdf(LR_uc, 1)
+
+    return N, p_value
+
+def calculate_var_and_backtest(rets, tickers, w, mu_vec, cov_mat, sigma_vec, port_ret, mu_p, sigma_p, confidence_levels):
+
+    # --- VaR por ativo (três métodos) ---
+    rows_assets = []
+    for i, t in enumerate(tickers):
+        r = rets[t]
+        mu_i = r.mean()
+        sd_i = r.std()
+        for alpha in confidence_levels:
+            vh = var_historico(r, alpha)
+            vp = var_parametrico_normal(mu_i, sd_i, alpha)
+            vmc = var_mc_normal_univariado(mu_i, sd_i, alpha, n_sims=50_000)
+            rows_assets.append({
+                "Ativo": t,
+                "Confiança": alpha,
+                "VaR_Histórico_%": 100*vh,
+                "VaR_Param_Norm_%": 100*vp,
+                "VaR_MonteCarlo_M_Uni_%": 100*vmc # Monte Carlo Univariado para ativo individual
+            })
+
+    df_assets = pd.DataFrame(rows_assets)
+
+    # --- VaR da carteira (três métodos) ---
+    rows_port = []
+    for alpha in confidence_levels:
+        vh = var_historico(port_ret, alpha)
+        vp = var_parametrico_normal(mu_p, sigma_p, alpha)
+        vmc = var_mc_normal_multivariado(mu_vec, cov_mat, w, alpha, n_sims=100_000)
+        rows_port.append({
+            "Confiança": alpha,
+            "VaR_Histórico_%": 100*vh,
+            "VaR_Param_Norm_%": 100*vp,
+            "VaR_MonteCarlo_M_Multi_%": 100*vmc # Monte Carlo Multivariado para carteira
+        })
+
+    df_port = pd.DataFrame(rows_port)
+
+    # --- Diversificação: soma dos VaRs individuais vs VaR da carteira ---
+    def soma_var_individuais(df_assets, alpha, metodo_col):
+        mask = df_assets["Confiança"] == alpha
+        return df_assets.loc[mask, metodo_col].sum()
+
+    rows_div = []
+    for alpha in confidence_levels:
+        # VaR Histórico
+        metodo_col = "VaR_Histórico_%"
+        var_sum_indiv = soma_var_individuais(df_assets, alpha, metodo_col)
+        var_port = float(df_port.loc[df_port["Confiança"] == alpha, metodo_col].iloc[0])
+        ganho_div = var_sum_indiv - var_port
+        rows_div.append({
+            "Confiança": alpha,
+            "Método": "VaR_Histórico",
+            "Soma_VaRs_Individuais_%": var_sum_indiv,
+            "VaR_Carteira_%": var_port,
+            "Ganho_Diversificação_%": ganho_div
+        })
+
+        # VaR Paramétrico Normal
+        metodo_col = "VaR_Param_Norm_%"
+        var_sum_indiv = soma_var_individuais(df_assets, alpha, metodo_col)
+        var_port = float(df_port.loc[df_port["Confiança"] == alpha, metodo_col].iloc[0])
+        ganho_div = var_sum_indiv - var_port
+        rows_div.append({
+            "Confiança": alpha,
+            "Método": "VaR_Param_Norm",
+            "Soma_VaRs_Individuais_%": var_sum_indiv,
+            "VaR_Carteira_%": var_port,
+            "Ganho_Diversificação_%": ganho_div
+        })
+
+        # VaR Monte Carlo (usando o univariado para a soma individual)
+        metodo_col = "VaR_MonteCarlo_M_Uni_%"
+        var_sum_indiv = soma_var_individuais(df_assets, alpha, metodo_col)
+        # Usando o multivariado para a carteira
+        var_port = float(df_port.loc[df_port["Confiança"] == alpha, "VaR_MonteCarlo_M_Multi_%"].iloc[0])
+        ganho_div = var_sum_indiv - var_port
+        rows_div.append({
+            "Confiança": alpha,
+            "Método": "VaR_MonteCarlo",
+            "Soma_VaRs_Individuais_%": var_sum_indiv,
+            "VaR_Carteira_%": var_port,
+            "Ganho_Diversificação_%": ganho_div
+        })
+
+    df_div = pd.DataFrame(rows_div)
+
+    # --- Backtesting (VaR Histórico e Paramétrico) ---
+
+    # 1. VaR Histórico Móvel (para backtesting)
+    # O VaR Histórico é o quantil (1-alpha) dos retornos da janela móvel
+    window = 252 # Janela de 1 ano (aprox)
+
+    backtest_results = []
+
+    for alpha in confidence_levels:
+        # VaR Histórico Móvel
+        var_hist_movel = -port_ret.rolling(window=window).quantile(1 - alpha).dropna() * 100.0
+        # O VaR é calculado com dados até t-1 para prever t.
+        # O VaR móvel deve ser alinhado com os retornos que ele está prevendo.
+        # O VaR é uma perda (positiva), o retorno é negativo em caso de perda.
+        # O VaR móvel é a perda máxima esperada para o dia seguinte.
+
+        # Alinhando as séries para o backtesting
+        # O VaR móvel começa a ter valores a partir do dia 'window'
+        rets_backtest = port_ret.loc[var_hist_movel.index]
+
+        # Backtesting VaR Histórico
+        N_hist, p_value_hist = kupiec_test(rets_backtest, var_hist_movel, alpha, window)
+
+        backtest_results.append({
+            "Confiança": alpha,
+            "Método": "VaR_Histórico",
+            "Violações": N_hist,
+            "Esperado": round(len(rets_backtest) * (1 - alpha)),
+            "P-Valor_Kupiec": p_value_hist,
+            "Adequado": "Sim" if p_value_hist > 0.05 else "Não"
+        })
+        # mu_movel e sigma_movel são calculados na janela móvel
+        mu_movel = port_ret.rolling(window=window).mean().dropna()
+        sigma_movel = port_ret.rolling(window=window).std().dropna()
+
+        # O VaR Paramétrico é calculado com base na média e desvio-padrão móveis
+        z = norm.ppf(1 - alpha)
+        var_param_movel = -(mu_movel + z * sigma_movel).loc[mu_movel.index].dropna() * 100.0
+
+        # Alinhando as séries para o backtesting
+        rets_backtest_param = port_ret.loc[var_param_movel.index]
+
+        # Backtesting VaR Paramétrico
+        N_param, p_value_param = kupiec_test(rets_backtest_param, var_param_movel, alpha, window)
+
+        backtest_results.append({
+            "Confiança": alpha,
+            "Método": "VaR_Param_Norm",
+            "Violações": N_param,
+            "Esperado": round(len(rets_backtest_param) * (1 - alpha)),
+            "P-Valor_Kupiec": p_value_param,
+            "Adequado": "Sim" if p_value_param > 0.05 else "Não"
+        })
+
+    df_backtest = pd.DataFrame(backtest_results)
+
+    return df_assets, df_port, df_div, df_backtest
+
+if __name__ == "__main__":
+    print("Iniciando a Calculadora de VaR...")
+
+    rets, valid_tickers, w, mu_vec, cov_mat, sigma_vec, port_ret, mu_p, sigma_p = get_data_and_returns(TICKERS, START_DATE, END_DATE)
+
+    if not valid_tickers:
+        print("Erro: Não foi possível baixar dados para nenhum dos tickers.")
+    else:
+        print(f"Tickers utilizados: {valid_tickers}")
+        print(f"Pesos da carteira: {w}")
+
+        df_assets, df_port, df_div, df_backtest = calculate_var_and_backtest(
+            rets, valid_tickers, w, mu_vec, cov_mat, sigma_vec, port_ret, mu_p, sigma_p, CONFIDENCE_LEVELS
+        )
+
+        # Create a directory to save results
+        output_dir = "./VaR_Results"
+        os.makedirs(output_dir, exist_ok=True)
+
+        # --- Resultados: tabelas ---
+        print("\n" + "="*50)
+        print("=== VaR por Ativo (% do patrimônio) ===")
+        print("="*50)
+        df_assets_pivot = df_assets.pivot_table(index=["Ativo"], columns="Confiança",
+                                                values=["VaR_Histórico_%","VaR_Param_Norm_%","VaR_MonteCarlo_M_Uni_%"])
+        print(df_assets_pivot.to_markdown(floatfmt=".2f"))
+
+        print("\n" + "="*50)
+        print("=== VaR da Carteira (% do patrimônio) ===")
+        print("="*50)
+        print(df_port.to_markdown(floatfmt=".2f"))
+
+        print("\n" + "="*50)
+        print("=== Diversificação (Soma dos VaRs individuais vs. VaR da Carteira) ===")
+        print("="*50)
+        print(df_div.to_markdown(floatfmt=".2f"))
+
+        print("\n" + "="*50)
+        print("=== Backtesting (Teste de Kupiec) ===")
+        print("="*50)
+        print(df_backtest.to_markdown(floatfmt=".4f"))
+
+        # --- Resultados: Gráficos (salvando em arquivos) ---
+
+        # Gráfico de VaR por Ativo
+        for alpha in CONFIDENCE_LEVELS:
+            fig, ax = plt.subplots(figsize=(8,4))
+            m = df_assets[df_assets["Confiança"] == alpha][["Ativo","VaR_Histórico_%","VaR_Param_Norm_%","VaR_MonteCarlo_M_Uni_%"]]
+            m.set_index("Ativo").plot(kind="bar", ax=ax)
+            ax.set_title(f"VaR por Ativo — Confiança {int(alpha*100)}%")
+            ax.set_ylabel("VaR (% 1 dia)")
+            ax.legend(title="Método")
+            plt.tight_layout()
+            plt.savefig(f"{output_dir}/var_ativo_{int(alpha*100)}.png")
+            plt.close(fig)
+
+        # Gráfico de VaR da Carteira
+        fig, ax = plt.subplots(figsize=(6,4))
+        df_port.set_index("Confiança")[["VaR_Histórico_%","VaR_Param_Norm_%","VaR_MonteCarlo_M_Multi_%"]].plot(kind="bar", ax=ax)
+        ax.set_title("VaR da Carteira por Método")
+        ax.set_ylabel("VaR (% 1 dia)")
+        ax.legend(title="Método")
+        plt.tight_layout()
+        plt.savefig(f"{output_dir}/var_carteira.png")
+        plt.close(fig)
+
+        print(f"\nGráficos salvos em {output_dir}/var_ativo_XX.png e {output_dir}/var_carteira.png")
+
+        # Salvar os DataFrames em um arquivo para referência
+        with pd.ExcelWriter(f"{output_dir}/resultados_var.xlsx") as writer:
+            df_assets.to_excel(writer, sheet_name='VaR_Ativos', index=False)
+            df_port.to_excel(writer, sheet_name='VaR_Carteira', index=False)
+            df_div.to_excel(writer, sheet_name='Diversificacao', index=False)
+            df_backtest.to_excel(writer, sheet_name='Backtesting', index=False)
+
+        print(f"Resultados completos salvos em {output_dir}/resultados_var.xlsx")
