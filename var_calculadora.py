@@ -7,20 +7,20 @@ from scipy.stats import norm, chi2
 import matplotlib.pyplot as plt
 import io
 
-# ========= Configuração da página ==========
-st.set_page_config(page_title="Calculadora de VaR", layout="wide")
-st.title("📊 Calculadora Interativa de Value at Risk (VaR)")
+# ========= Configuração =========
+st.set_page_config(page_title="Painel VaR - Três Métodos", layout="wide")
+st.title("📊 Painel Interativo de Value at Risk (VaR) — Comparação Completa")
 
 st.markdown("""
-Ferramenta interativa para cálculo e visualização do **Value at Risk (VaR)**:
-- 📈 Histórico
-- 📊 Paramétrico (Normal)
-- 🎲 Monte Carlo
-- 📉 Curva temporal de VaR e Backtesting
+Este painel calcula, compara e mostra a **curva temporal do VaR** de uma carteira com três métodos:
+- 📈 **Histórico**
+- 📊 **Paramétrico (Normal)**
+- 🎲 **Monte Carlo**
+
+Inclui **backtesting de Kupiec**, **gráficos dinâmicos** e **download dos resultados**.
 """)
 
-# ========= Funções auxiliares ==========
-
+# ========= Funções base =========
 def get_data_and_returns(tickers, start, end):
     prices = yf.download(tickers, start=start, end=end, auto_adjust=True, progress=False)["Close"]
     prices = prices.dropna(how="all").dropna(axis=1)
@@ -40,7 +40,7 @@ def var_parametrico(mu, sigma, alpha):
     var = -(mu + z * sigma)
     return float(max(0.0, var))
 
-def var_mc(mu_vec, cov, w, alpha, n_sims):
+def var_mc(mu_vec, cov, w, alpha, n_sims=100_000):
     sims = np.random.multivariate_normal(mean=mu_vec, cov=cov, size=n_sims)
     port_sims = sims @ w
     q = np.quantile(port_sims, 1 - alpha)
@@ -63,18 +63,17 @@ def kupiec_test(returns, var_values, alpha):
     p_value = 1 - chi2.cdf(LR_uc, 1)
     return N, p_value
 
-# ========= Painel lateral =========
+# ========= Parâmetros =========
 with st.sidebar:
-    st.header("⚙️ Parâmetros de Entrada")
+    st.header("⚙️ Parâmetros da Análise")
     tickers = st.text_input("Tickers (separados por vírgula)", "VBBR3.SA, MCD, UBER, VALE3.SA, GS")
     tickers = [t.strip().upper() for t in tickers.split(",") if t.strip()]
     start = st.date_input("Data inicial", pd.to_datetime("2020-01-01"))
     end = st.date_input("Data final", pd.Timestamp.today())
     confidence = st.selectbox("Nível de confiança", [0.95, 0.975, 0.99], index=0)
-    metodo = st.selectbox("Método de VaR", ["Histórico", "Paramétrico (Normal)", "Monte Carlo"])
     n_sims = st.number_input("Simulações (Monte Carlo)", 10_000, 200_000, 100_000, step=10_000)
     usar_pesos = st.checkbox("Inserir pesos personalizados")
-    run = st.button("🚀 Calcular e Mostrar Curva de VaR")
+    run = st.button("🚀 Rodar Análise Completa")
 
 # ========= Execução =========
 if run:
@@ -101,63 +100,78 @@ if run:
         st.success(f"✅ Tickers válidos: {valid_tickers}")
         st.write("Pesos da carteira:", np.round(w, 3))
 
-        # ========== VaR Estático ==========
-        if metodo == "Histórico":
-            var_val = var_historico(port_ret, confidence)
-        elif metodo == "Paramétrico (Normal)":
-            var_val = var_parametrico(mu_p, sigma_p, confidence)
-        else:
-            var_val = var_mc(mu_vec, cov_mat, w, confidence, n_sims)
+        # ========= VaR Estático =========
+        vh = var_historico(port_ret, confidence)
+        vp = var_parametrico(mu_p, sigma_p, confidence)
+        vm = var_mc(mu_vec, cov_mat, w, confidence, n_sims)
 
         st.subheader("📉 VaR Estático da Carteira")
-        st.metric(f"VaR {int(confidence*100)}%", f"{100 * var_val:.3f}%")
+        col1, col2, col3 = st.columns(3)
+        col1.metric(f"Histórico ({int(confidence*100)}%)", f"{100*vh:.3f}%")
+        col2.metric(f"Paramétrico ({int(confidence*100)}%)", f"{100*vp:.3f}%")
+        col3.metric(f"Monte Carlo ({int(confidence*100)}%)", f"{100*vm:.3f}%")
 
-        # ========== Curva temporal do VaR ==========
+        # ========= Curvas Temporais =========
+        st.subheader("📊 Curvas Temporais do VaR e Retornos")
         window = 252
-        st.subheader("📊 Curva Temporal do VaR e Retornos")
 
-        if metodo == "Histórico":
-            var_curve = -port_ret.rolling(window).quantile(1 - confidence)
-        else:
-            mu_roll = port_ret.rolling(window).mean()
-            sigma_roll = port_ret.rolling(window).std()
-            z = norm.ppf(1 - confidence)
-            var_curve = -(mu_roll + z * sigma_roll)
+        # Retornos
+        port_ret_pct = port_ret * 100
 
-        var_curve = var_curve.dropna() * 100
-        port_ret_pct = port_ret.loc[var_curve.index] * 100
+        # Histórico
+        var_hist = -port_ret.rolling(window).quantile(1 - confidence).dropna() * 100
+        # Paramétrico
+        mu_roll = port_ret.rolling(window).mean()
+        sigma_roll = port_ret.rolling(window).std()
+        z = norm.ppf(1 - confidence)
+        var_param = -(mu_roll + z * sigma_roll).dropna() * 100
+        # Monte Carlo aproximado (via covariância)
+        mc_curve = []
+        for i in range(window, len(port_ret)):
+            mu_local = rets.iloc[i-window:i].mean().values
+            cov_local = rets.iloc[i-window:i].cov().values
+            var_val = var_mc(mu_local, cov_local, w, confidence, int(n_sims/50))  # reduzir para velocidade
+            mc_curve.append(var_val*100)
+        var_mc_curve = pd.Series(mc_curve, index=port_ret.index[window:])
 
-        # Violations
-        violations = port_ret_pct < -var_curve
-        n_viol = violations.sum()
-
-        # Plotar
-        fig, ax = plt.subplots(figsize=(10,5))
-        ax.plot(port_ret_pct.index, port_ret_pct, label="Retornos (%)", color="gray", alpha=0.6)
-        ax.plot(var_curve.index, -var_curve, label=f"-VaR {int(confidence*100)}%", color="red", linewidth=2)
-        ax.scatter(port_ret_pct.index[violations], port_ret_pct[violations], color="red", marker="x", s=40, label="Violações")
-        ax.set_title(f"Curva Temporal do VaR ({metodo}) — {int(confidence*100)}%")
-        ax.set_ylabel("Retornos (%)")
+        # ========== Gráfico ==========
+        fig, ax = plt.subplots(figsize=(10, 5))
+        ax.plot(port_ret_pct.index, port_ret_pct, color="gray", alpha=0.5, label="Retornos (%)")
+        ax.plot(var_hist.index, -var_hist, label="VaR Histórico", color="blue", linewidth=1.8)
+        ax.plot(var_param.index, -var_param, label="VaR Paramétrico", color="orange", linewidth=1.8)
+        ax.plot(var_mc_curve.index, -var_mc_curve, label="VaR Monte Carlo", color="green", linewidth=1.8)
+        ax.set_title(f"Curvas de VaR ({int(confidence*100)}%) — Janela {window} dias")
+        ax.set_ylabel("Retorno / VaR (%)")
         ax.legend()
         st.pyplot(fig)
 
-        st.markdown(f"🔴 **Número de violações:** {n_viol}  —  ({n_viol/len(var_curve)*100:.2f}% das observações)")
-
-        # ========== Backtesting ==========
+        # ========= Backtesting =========
         st.subheader("🧪 Backtesting (Kupiec Test)")
-        N, p_value = kupiec_test(port_ret_pct / 100, var_curve, confidence)
-        st.write(f"Violações observadas: {N}")
-        st.write(f"P-valor do teste: {p_value:.4f}")
-        st.write("Adequação:", "✅ Sim" if p_value > 0.05 else "❌ Não")
+        results_bt = []
+        for metodo, var_series in [("Histórico", var_hist), ("Paramétrico", var_param), ("Monte Carlo", var_mc_curve)]:
+            aligned = port_ret.loc[var_series.index]
+            N, p_value = kupiec_test(aligned, var_series, confidence)
+            results_bt.append({
+                "Método": metodo,
+                "Violações": N,
+                "P-valor": p_value,
+                "Adequado": "Sim" if p_value > 0.05 else "Não"
+            })
+        df_bt = pd.DataFrame(results_bt)
+        st.dataframe(df_bt.style.format(precision=4))
 
-        # ========== Download ==========
+        # ========= Download =========
+        st.subheader("💾 Download dos Resultados")
         buffer = io.BytesIO()
-        df_curve = pd.DataFrame({"Retornos_%": port_ret_pct, f"VaR_{int(confidence*100)}_%": -var_curve})
         with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-            df_curve.to_excel(writer, sheet_name="Curva_VaR", index=True)
+            pd.DataFrame({"Retornos_%": port_ret_pct}).to_excel(writer, sheet_name="Retornos", index=True)
+            var_hist.to_excel(writer, sheet_name="VaR_Histórico")
+            var_param.to_excel(writer, sheet_name="VaR_Paramétrico")
+            var_mc_curve.to_excel(writer, sheet_name="VaR_MonteCarlo")
+            df_bt.to_excel(writer, sheet_name="Backtesting", index=False)
         st.download_button(
-            label="💾 Baixar Curva de VaR (Excel)",
+            label="⬇️ Baixar Resultados (Excel)",
             data=buffer.getvalue(),
-            file_name="curva_var.xlsx",
+            file_name="analise_var_completa.xlsx",
             mime="application/vnd.ms-excel",
         )
